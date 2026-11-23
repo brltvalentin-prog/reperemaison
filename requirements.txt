@@ -1,0 +1,4 @@
+streamlit
+requests
+shapely>=2.0
+pyproj
