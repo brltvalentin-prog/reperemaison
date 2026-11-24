@@ -51,8 +51,8 @@ if ok:
         try:
             with st.spinner("Analyse en cours (de quelques secondes à quelques minutes)…"):
                 doc = calculer(commune, cp, terrain, habitable, tolerance, classe, maison, hab_tol, dpe)
-            st.success(f"Résultats pour {commune}. Cercles bleus : adresses trouvées via les DPE. "
-                       "Parcelles rouges : meilleurs candidats du cadastre.")
+            st.success(f"Résultats pour {commune} : une seule liste, avec un indice global. "
+                       "Change de méthode (global, cadastre seul, DPE seul) au-dessus du tableau.")
             components.html(doc, height=1000, scrolling=True)
         except (RuntimeError, SystemExit) as e:
             st.error(str(e))

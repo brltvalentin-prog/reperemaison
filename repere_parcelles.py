@@ -13,6 +13,7 @@ Autre annonce :
 """
 import argparse, csv, gzip, html, json, re, sys, unicodedata, webbrowser
 from pathlib import Path
+from urllib.parse import quote
 
 import requests
 from pyproj import Transformer
@@ -116,8 +117,14 @@ def score_cadastre(r):
 
 
 def score_global(s_cad, s_dpe):
-    """Cadastre + DPE quand une adresse DPE tombe sur la parcelle ; sinon cadastre seul, un peu pénalisé."""
-    return round(0.55 * s_cad + 0.45 * s_dpe) if s_dpe is not None else round(0.75 * s_cad)
+    """Indice unique : 55 % cadastre + 45 % DPE ; si un seul des deux existe, il compte pour 75 %."""
+    if s_cad is not None and s_dpe is not None:
+        return round(0.55 * s_cad + 0.45 * s_dpe)
+    if s_cad is not None:
+        return round(0.75 * s_cad)
+    if s_dpe is not None:
+        return round(0.75 * s_dpe)
+    return 0
 
 
 def analyser(args, parcelles, batiments):
@@ -305,92 +312,92 @@ def liens_html(lat, lon):
     return " · ".join(f'<a href="{u}" target="_blank" rel="noopener">{k}</a>' for k, u in liens(lat, lon).items())
 
 
+def detail_dpe(d):
+    t = f"DPE {d['classe'] or '?'} · {int(d['surface'])} m²"
+    if d.get("annee"):
+        t += f" · construit {d['annee']}"
+    return t
+
+
 def fusionner(res, dpe, args):
-    """Rapproche parcelles du cadastre et adresses DPE, calcule les trois scores (cadastre, DPE, global)."""
-    par = {}
-    for d in dpe:
-        if d.get("parcelle") and (d["parcelle"] not in par or d["s_dpe"] > par[d["parcelle"]]["s_dpe"]):
-            par[d["parcelle"]] = d
+    """Une seule liste : parcelles du cadastre + adresses DPE, avec scores cadastre, DPE et global."""
+    par, libres = {}, []
+    for d in sorted(dpe, key=lambda d: -d["s_dpe"]):
+        pid = d.get("parcelle")
+        if not pid:
+            libres.append(d)
+        elif pid not in par:
+            par[pid] = d  # la meilleure adresse DPE de la parcelle
     deja = set()
     for r in res:
         d = par.get(r["parcelle"])
-        r["dpe"] = d["adresse"] if d else ""
-        r["s_dpe"] = d["s_dpe"] if d else None
+        r.update(dpe=d["adresse"] if d else "", s_dpe=d["s_dpe"] if d else None,
+                 dpe_pos=d.get("pos") if d else None, dpe_detail=detail_dpe(d) if d else "")
         deja.add(r["parcelle"])
-    for pid, d in par.items():  # parcelles repérées par le DPE seulement (terrain différent de l'annonce)
-        if pid in deja or not d.get("geom") or not d.get("pos"):
+    for pid, d in par.items():  # parcelle repérée par le DPE mais au terrain différent de l'annonce
+        if pid in deja:
             continue
+        pos = d.get("pos")
         res.append({"parcelle": pid, "terrain_m2": d.get("terrain") or 0, "emprise_principale_m2": None,
                     "nb_batiments": 0, "forme_rectangle_pct": None,
                     "s_terrain": score_terrain(d["terrain"], args.terrain, args.tolerance) if d.get("terrain") else None,
-                    "s_emprise": None, "s_forme": None, "lat": round(d["pos"][0], 6), "lon": round(d["pos"][1], 6),
-                    "geom": d["geom"], "dpe": d["adresse"], "s_dpe": d["s_dpe"]})
+                    "s_emprise": None, "s_forme": None, "geom": d.get("geom"),
+                    "lat": round(pos[0], 6) if pos else None, "lon": round(pos[1], 6) if pos else None,
+                    "dpe": d["adresse"], "s_dpe": d["s_dpe"], "dpe_pos": pos, "dpe_detail": detail_dpe(d)})
+    for d in libres:  # adresse DPE sans parcelle retrouvée : on la garde dans la liste
+        pos = d.get("pos")
+        res.append({"parcelle": "", "terrain_m2": 0, "emprise_principale_m2": None, "nb_batiments": 0,
+                    "forme_rectangle_pct": None, "geom": None,
+                    "lat": round(pos[0], 6) if pos else None, "lon": round(pos[1], 6) if pos else None,
+                    "dpe": d["adresse"], "s_dpe": d["s_dpe"], "dpe_pos": pos, "dpe_detail": detail_dpe(d)})
     for r in res:
-        r["s_cad"] = score_cadastre(r)
+        r["s_cad"] = score_cadastre(r) if r.get("geom") else None
         r["s_glob"] = score_global(r["s_cad"], r["s_dpe"])
     res.sort(key=lambda r: -r["s_glob"])
     return res
 
 
+def liens_ligne(r):
+    if r.get("lat") is not None:
+        return liens_html(r["lat"], r["lon"])
+    q = quote(r["dpe"])
+    return f'<a href="https://www.google.com/maps/search/?api=1&query={q}" target="_blank" rel="noopener">Google Maps</a>'
+
+
 def ecrire(res, nom, args, dpe=None):
-    dpe = dpe or []
     OUT.mkdir(exist_ok=True)
+    v = lambda x: "" if x is None else x
     with open(OUT / "candidats.csv", "w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f, delimiter=";")
-        w.writerow(["rang", "parcelle", "terrain_m2", "emprise_principale_m2", "nb_batiments",
-                    "forme_rectangle_pct", "score_global", "score_cadastre", "score_dpe", "lat", "lon",
-                    "satellite", "street_view", "adresse_dpe"])
+        w.writerow(["rang", "indice_global", "score_cadastre", "score_dpe", "parcelle", "adresse_dpe", "detail_dpe",
+                    "terrain_m2", "emprise_principale_m2", "forme_rectangle_pct", "lat", "lon"])
         for i, r in enumerate(res, 1):
-            l = liens(r["lat"], r["lon"])
-            w.writerow([i, r["parcelle"], r["terrain_m2"], r["emprise_principale_m2"] or "", r["nb_batiments"],
-                        r["forme_rectangle_pct"] or "", r["s_glob"], r["s_cad"],
-                        "" if r["s_dpe"] is None else r["s_dpe"], r["lat"], r["lon"],
-                        l["Satellite"], l["Street View"], r.get("dpe", "")])
-    if dpe:
-        with open(OUT / "candidats_dpe.csv", "w", newline="", encoding="utf-8-sig") as f:
-            w = csv.writer(f, delimiter=";")
-            w.writerow(["rang", "adresse", "classe", "surface_m2", "annee_construction", "date_dpe",
-                        "parcelle", "terrain_m2", "score"])
-            for i, d in enumerate(dpe, 1):
-                w.writerow([i, d["adresse"], d["classe"], d["surface"], d.get("annee") or "", d["date"],
-                            d.get("parcelle", ""), d.get("terrain", ""), d["score"]])
+            w.writerow([i, r["s_glob"], v(r["s_cad"]), v(r["s_dpe"]), r["parcelle"], r.get("dpe", ""),
+                        r.get("dpe_detail", ""), r["terrain_m2"] or "", v(r["emprise_principale_m2"]),
+                        v(r["forme_rectangle_pct"]), v(r["lat"]), v(r["lon"])])
     feats = []
     for r in res:
-        a = liens_html(r["lat"], r["lon"])
-        dpe_txt = "–" if r["s_dpe"] is None else r["s_dpe"]
-        extra = f"<br>✔ DPE : {html.escape(r['dpe'])}" if r.get("dpe") else ""
-        info = (f"<b>{html.escape(r['parcelle'])}</b><br>Global {r['s_glob']} · cadastre {r['s_cad']} · DPE {dpe_txt}<br>"
-                f"Terrain {r['terrain_m2']} m²"
-                + (f" · bâtiment {r['emprise_principale_m2']} m²" if r["emprise_principale_m2"] else "")
-                + f"{extra}<br>{a}")
-        feats.append({"type": "Feature", "geometry": r["geom"],
+        a = liens_ligne(r)
+        titre = r["parcelle"] or r["dpe"]
+        info = (f"<b>{html.escape(titre)}</b><br>Global {r['s_glob']} · cadastre {v(r['s_cad']) or '–'} · "
+                f"DPE {v(r['s_dpe']) if r['s_dpe'] is not None else '–'}")
+        if r["terrain_m2"]:
+            info += f"<br>Terrain {r['terrain_m2']} m²"
+            if r["emprise_principale_m2"]:
+                info += f" · bâtiment {r['emprise_principale_m2']} m²"
+        if r.get("dpe"):
+            info += f"<br>✔ {html.escape(r['dpe'])}<br>{html.escape(r['dpe_detail'])}"
+        info += f"<br>{a}"
+        pos = r.get("dpe_pos")
+        feats.append({"type": "Feature", "geometry": r.get("geom"),
                       "properties": {"popup": info, "s_glob": r["s_glob"], "s_cad": r["s_cad"], "s_dpe": r["s_dpe"],
-                                     "terrain": r["terrain_m2"], "emprise": r["emprise_principale_m2"],
-                                     "dpe": r.get("dpe", ""), "liens": a}})
-    pts, dl = [], []
-    for i, d in enumerate(dpe, 1):
-        detail = f"DPE {d['classe'] or '?'} · {int(d['surface'])} m²"
-        if d.get("terrain"):
-            detail += f" · terrain {d['terrain']} m²"
-        if d.get("annee"):
-            detail += f" · construit {d['annee']}"
-        a = liens_html(*d["pos"]) if d.get("pos") else ""
-        dl.append(f"<tr><td>{i}</td><td>{html.escape(d['adresse'])}</td><td>{detail}</td>"
-                  f"<td><b>{d['score']}</b></td><td>{a}</td></tr>")
-        if d.get("pos"):
-            pts.append({"lat": d["pos"][0], "lon": d["pos"][1],
-                        "popup": f"<b>DPE #{i}</b><br>{html.escape(d['adresse'])}<br>{detail}<br>{a}"})
-    bloc = ""
-    if dl:
-        bloc = ("<h3>Adresses trouvées via les diagnostics énergétiques (DPE)</h3>"
-                "<p>Cercles bleus sur la carte. Base publique ADEME : à utiliser pour repérer le bien avant de "
-                "contacter l’agence ou le vendeur, dans le respect de la vie privée des occupants.</p>"
-                "<div style='overflow-x:auto'><table><tr><th>#</th><th>Adresse</th><th>Détail</th><th>Score</th><th>Liens</th></tr>"
-                + "\n".join(dl) + "</table></div><h3>Parcelles candidates (cadastre)</h3>")
+                                     "terrain": r["terrain_m2"] or None, "emprise": r["emprise_principale_m2"],
+                                     "nom": r["parcelle"], "dpe": r.get("dpe", ""), "liens": a,
+                                     "pos": [pos[0], pos[1]] if pos else None,
+                                     "centre": [r["lat"], r["lon"]] if r.get("geom") and r.get("lat") is not None else None}})
     data = json.dumps({"type": "FeatureCollection", "features": feats}).replace("</", "<\\/")
     page = PAGE.replace("__DATA__", data) \
-               .replace("__PTS__", json.dumps(pts).replace("</", "<\\/")).replace("__DPE__", bloc) \
-               .replace("__TITRE__", html.escape(f"{nom} – {len(dpe)} adresse(s) DPE, {len(res)} parcelles")) \
+               .replace("__TITRE__", html.escape(f"{nom} – {len(res)} candidats")) \
                .replace("__CRIT__", html.escape(f"Terrain ≈ {args.terrain:.0f} m² (±{args.tolerance*100:.0f} %), "
                                                 f"habitable ≈ {args.habitable:.0f} m²"))
     (OUT / "candidats.html").write_text(page, encoding="utf-8")
@@ -400,55 +407,89 @@ def ecrire(res, nom, args, dpe=None):
 PAGE = """<!DOCTYPE html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>__TITRE__</title>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
 <style>body{font:15px system-ui,sans-serif;margin:0}#map{height:55vh}main{padding:12px 16px}
-table{border-collapse:collapse;width:100%}td,th{border-bottom:1px solid #ddd;padding:6px;text-align:left}
+table{border-collapse:collapse;width:100%}td,th{border-bottom:1px solid #ddd;padding:6px;text-align:left}tbody tr{cursor:pointer}
 .ctl{display:flex;flex-wrap:wrap;gap:14px;align-items:center;margin:8px 0}.ctl label{display:flex;gap:6px;align-items:center}
 .leg span{display:inline-block;width:12px;height:12px;border-radius:2px;margin:0 4px 0 10px;vertical-align:middle}
-.mute{color:#666;font-size:.85rem}</style>
-</head><body><div id="map"></div><main><h2>__TITRE__</h2><p>__CRIT__</p>
+.mute{color:#666;font-size:.85rem}#err{color:#b91c1c;font-weight:600}</style>
+</head><body><div id="map"></div><main><h2>__TITRE__</h2><p>__CRIT__</p><div id="err"></div>
 <div class="ctl">
-<label>Méthode <select id="mode"><option value="glob">Score global (cadastre + DPE)</option>
+<label>Méthode <select id="mode"><option value="glob">Indice global (cadastre + DPE)</option>
 <option value="cad">Cadastre seul</option><option value="dpe">DPE seul</option></select></label>
 <label>Score minimum <b id="minv">0</b> <input type="range" id="min" min="0" max="100" value="0"></label>
-<label><input type="checkbox" id="showdpe" checked> Adresses DPE (cercles bleus)</label></div>
-<p class="leg">Contour des parcelles :<span style="background:#dc2626"></span>85 et +<span style="background:#f97316"></span>70-84<span style="background:#eab308"></span>50-69<span style="background:#9ca3af"></span>moins de 50</p>
-__DPE__
-<div style="overflow-x:auto"><table><thead><tr><th>#</th><th>Global</th><th>Cadastre</th><th>DPE</th><th>Terrain m²</th><th>Bâtiment m²</th><th>Adresse DPE</th><th>Liens</th></tr></thead>
+<label><input type="checkbox" id="showdpe" checked> Points des adresses DPE</label></div>
+<p class="leg">Couleur :<span style="background:#dc2626"></span>85 et +<span style="background:#f97316"></span>70-84<span style="background:#eab308"></span>50-69<span style="background:#9ca3af"></span>moins de 50</p>
+<p class="mute" id="stat"></p>
+<div style="overflow-x:auto"><table><thead><tr><th>#</th><th>Global</th><th>Cadastre</th><th>DPE</th><th>Parcelle / adresse DPE</th><th>Terrain m²</th><th>Bâtiment m²</th><th>Liens</th></tr></thead>
 <tbody id="rows"></tbody></table></div>
-<p class="mute">Score cadastre = terrain, emprise du bâtiment et forme. Score DPE = surface habitable et classe énergie d’une adresse tombant sur la parcelle.
-Score global = 55 % cadastre + 45 % DPE ; sans adresse DPE sur la parcelle, cadastre × 0,75. Le tableau est trié selon la méthode choisie.</p></main>
+<p class="mute">Une seule liste. Indice global = 55 % cadastre (terrain, emprise du bâtiment, forme) + 45 % DPE (surface habitable et classe énergie d’une adresse tombant sur la parcelle) ;
+si un seul des deux existe, il compte pour 75 %. Touche une ligne pour la voir sur la carte. Adresses issues de la base publique ADEME : à utiliser pour repérer le bien
+avant de contacter l’agence ou le vendeur, dans le respect de la vie privée des occupants.</p></main>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script>
-var data=__DATA__,pts=__PTS__,premier=true;
-var ortho=L.tileLayer('https://data.geopf.fr/wmts?SERVICE=WMTS&REQUEST=GetTile&VERSION=1.0.0&LAYER=ORTHOIMAGERY.ORTHOPHOTOS&STYLE=normal&TILEMATRIXSET=PM&TILEMATRIX={z}&TILEROW={y}&TILECOL={x}&FORMAT=image/jpeg',{maxZoom:19,attribution:'© IGN'});
-var osm=L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19,attribution:'© OpenStreetMap'});
-var map=L.map('map',{layers:[ortho]});L.control.layers({'Photo aérienne IGN':ortho,'Plan OSM':osm}).addTo(map);
-var lay=L.layerGroup().addTo(map),dl=L.layerGroup().addTo(map);
-pts.forEach(function(p){L.circleMarker([p.lat,p.lon],{radius:9,color:'#1d4ed8',weight:3,fillOpacity:.5}).bindPopup(p.popup).addTo(dl)});
+var data=__DATA__,refs=[],map=null,lay=null,dl=null;
 function $(i){return document.getElementById(i)}
+function err(e){$('err').textContent='Problème d’affichage de la carte : '+(e&&e.message?e.message:e)}
+try{
+  var ortho=L.tileLayer('https://data.geopf.fr/wmts?SERVICE=WMTS&REQUEST=GetTile&VERSION=1.0.0&LAYER=ORTHOIMAGERY.ORTHOPHOTOS&STYLE=normal&TILEMATRIXSET=PM&TILEMATRIX={z}&TILEROW={y}&TILECOL={x}&FORMAT=image/jpeg',{maxZoom:19,attribution:'© IGN'});
+  var osm=L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19,attribution:'© OpenStreetMap'});
+  map=L.map('map',{center:[46.6,2.4],zoom:6,layers:[ortho]});
+  L.control.layers({'Photo aérienne IGN':ortho,'Plan OSM':osm}).addTo(map);
+  lay=L.featureGroup().addTo(map);dl=L.featureGroup().addTo(map);
+}catch(e){map=null;err(e)}
 function sc(p){var m=$('mode').value;return m=='cad'?p.s_cad:(m=='dpe'?p.s_dpe:p.s_glob)}
 function col(v){return v>=85?'#dc2626':(v>=70?'#f97316':(v>=50?'#eab308':'#9ca3af'))}
 function cell(tr,t){var td=document.createElement('td');td.textContent=t;tr.appendChild(td);return td}
-function render(){
-  lay.clearLayers();var tb=$('rows');tb.innerHTML='';
-  var mn=+$('min').value;$('minv').textContent=mn;
-  var items=data.features.filter(function(f){var v=sc(f.properties);return v!==null&&v!==undefined&&v>=mn})
-    .sort(function(a,b){return sc(b.properties)-sc(a.properties)});
-  items.forEach(function(f,i){
-    var p=f.properties,c=col(sc(p));
-    L.geoJSON(f,{style:function(){return{color:c,weight:3,fillColor:c,fillOpacity:.2}},
-      onEachFeature:function(ft,l){l.bindPopup(p.popup)}}).addTo(lay);
-    var tr=document.createElement('tr');
-    cell(tr,i+1);cell(tr,p.s_glob);cell(tr,p.s_cad);cell(tr,p.s_dpe===null?'–':p.s_dpe);cell(tr,p.terrain);
-    cell(tr,p.emprise===null?'–':p.emprise);cell(tr,p.dpe||'');cell(tr,'').innerHTML=p.liens;
+function items(){var mn=+$('min').value;
+  return data.features.filter(function(f){var v=sc(f.properties);return v!==null&&v!==undefined&&v>=mn})
+    .sort(function(a,b){return sc(b.properties)-sc(a.properties)})}
+function renderTable(its){
+  var tb=$('rows');tb.innerHTML='';
+  its.forEach(function(f,i){
+    var p=f.properties,tr=document.createElement('tr');
+    cell(tr,i+1);cell(tr,p.s_glob).style.fontWeight='700';cell(tr,p.s_cad===null?'–':p.s_cad);cell(tr,p.s_dpe===null?'–':p.s_dpe);
+    cell(tr,(p.nom?p.nom+' ':'')+(p.dpe?'· '+p.dpe:''));cell(tr,p.terrain||'–');cell(tr,p.emprise||'–');cell(tr,'').innerHTML=p.liens;
+    tr.onclick=function(){var r=refs[i];if(!r||!map)return;
+      if(r.getBounds){map.fitBounds(r.getBounds().pad(.6))}else{map.setView(r.getLatLng(),18)}r.openPopup()};
     tb.appendChild(tr);
   });
-  if(!items.length){var tr=document.createElement('tr');cell(tr,'Aucune parcelle à ce niveau : baisse le score minimum ou change de méthode.').colSpan=8;tb.appendChild(tr)}
-  if(premier){premier=false;var b=L.geoJSON(data).getBounds();pts.forEach(function(p){b.extend([p.lat,p.lon])});
-    if(b.isValid()){map.fitBounds(b.pad(.1))}else{map.setView([46.6,2.4],6)}}
+  if(!its.length){var tr=document.createElement('tr');cell(tr,'Aucun résultat à ce niveau : baisse le score minimum ou change de méthode.').colSpan=8;tb.appendChild(tr)}
 }
-$('mode').onchange=render;$('min').oninput=render;
-$('showdpe').onchange=function(){if(this.checked){map.addLayer(dl)}else{map.removeLayer(dl)}};
-render();
+function flat(c,out){if(typeof c[0]=='number'){out.push(c)}else{c.forEach(function(x){flat(x,out)})}}
+function rings(g){if(!g)return[];if(g.type=='Polygon')return g.coordinates;
+  if(g.type=='MultiPolygon'){var r=[];g.coordinates.forEach(function(p){p.forEach(function(x){r.push(x)})});return r}return[]}
+function plan(its){ /* secours si la bibliothèque de carte ne se charge pas : contours seuls */
+  var m=$('map'),pts=[];its.forEach(function(f){if(f.geometry)flat(f.geometry.coordinates,pts)});
+  if(!pts.length){m.textContent='Aucun contour à afficher.';return}
+  var x0=1e9,x1=-1e9,y0=1e9,y1=-1e9;pts.forEach(function(c){x0=Math.min(x0,c[0]);x1=Math.max(x1,c[0]);y0=Math.min(y0,c[1]);y1=Math.max(y1,c[1])});
+  var k=Math.cos((y0+y1)/2*Math.PI/180),s=560/Math.max((x1-x0)*k,(y1-y0),1e-9),out='<svg viewBox="-10 -10 580 580" style="width:100%;height:100%;background:#f3f4f6">';
+  its.forEach(function(f){var c=col(sc(f.properties));rings(f.geometry).forEach(function(r){
+    out+='<path d="'+r.map(function(q,i){return(i?'L':'M')+((q[0]-x0)*k*s).toFixed(1)+','+((y1-q[1])*s).toFixed(1)}).join('')+'Z" fill="'+c+'" fill-opacity=".35" stroke="'+c+'" stroke-width="2"/>'})});
+  m.innerHTML=out+'</svg>';
+}
+function renderMap(its,refit){
+  if(typeof L==='undefined'||!map){plan(its);return}
+  lay.clearLayers();dl.clearLayers();refs=[];
+  its.forEach(function(f,i){
+    var p=f.properties,c=col(sc(p)),ref=null;
+    if(f.geometry){L.geoJSON(f,{style:function(){return{color:c,weight:3,fillColor:c,fillOpacity:.2}},
+      onEachFeature:function(ft,l){l.bindPopup(p.popup);ref=l}}).addTo(lay)}
+    if(p.centre){L.circleMarker(p.centre,{radius:5,color:c,weight:2,fillColor:c,fillOpacity:.9}).bindPopup(p.popup).addTo(lay)}
+    if(p.pos){var mk=L.circleMarker(p.pos,{radius:8,color:'#1d4ed8',weight:3,fillColor:c,fillOpacity:.9}).bindPopup(p.popup).addTo(dl);if(!ref)ref=mk}
+    refs[i]=ref;
+  });
+  if(refit){var b=L.latLngBounds([]);  /* on cadre les 8 meilleurs résultats, pas toute la commune */
+    its.slice(0,8).forEach(function(f){if(f.geometry){b.extend(L.geoJSON(f).getBounds())}if(f.properties.pos){b.extend(f.properties.pos)}});
+    if(b.isValid()){map.fitBounds(b.pad(.2),{maxZoom:18})}}
+}
+function render(refit){
+  var its=items();$('minv').textContent=$('min').value;
+  $('stat').textContent=its.length+' résultat(s) sur '+data.features.length;
+  try{renderTable(its)}catch(e){err(e)}
+  try{renderMap(its,refit)}catch(e){err(e)}
+}
+$('mode').onchange=function(){render(true)};$('min').oninput=function(){render(false)};
+$('showdpe').onchange=function(){if(!map)return;if(this.checked){map.addLayer(dl)}else{map.removeLayer(dl)}};
+render(true);
 </script></body></html>"""
 
 
@@ -499,7 +540,7 @@ def run(args, log=print):
         except Exception as e:
             log(f"DPE indisponible ({e}) : seuls les résultats du cadastre sont affichés.")
     res = fusionner(res, dpe, args)
-    if not res and not dpe:
+    if not res:
         raise RuntimeError("Aucun candidat. Élargis la tolérance ou baisse la taille minimale du bâtiment.")
     res = res[:getattr(args, "max_resultats", 60)]
     page = ecrire(res, nom, args, dpe)
