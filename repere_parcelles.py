@@ -332,7 +332,8 @@ def fusionner(res, dpe, args):
     for r in res:
         d = par.get(r["parcelle"])
         r.update(dpe=d["adresse"] if d else "", s_dpe=d["s_dpe"] if d else None,
-                 dpe_pos=d.get("pos") if d else None, dpe_detail=detail_dpe(d) if d else "")
+                 dpe_pos=d.get("pos") if d else None, dpe_detail=detail_dpe(d) if d else "",
+                 dpe_classe=d["classe"] if d else "", dpe_annee=d.get("annee") if d else None)
         deja.add(r["parcelle"])
     for pid, d in par.items():  # parcelle repérée par le DPE mais au terrain différent de l'annonce
         if pid in deja:
@@ -343,13 +344,15 @@ def fusionner(res, dpe, args):
                     "s_terrain": score_terrain(d["terrain"], args.terrain, args.tolerance) if d.get("terrain") else None,
                     "s_emprise": None, "s_forme": None, "geom": d.get("geom"),
                     "lat": round(pos[0], 6) if pos else None, "lon": round(pos[1], 6) if pos else None,
-                    "dpe": d["adresse"], "s_dpe": d["s_dpe"], "dpe_pos": pos, "dpe_detail": detail_dpe(d)})
+                    "dpe": d["adresse"], "s_dpe": d["s_dpe"], "dpe_pos": pos, "dpe_detail": detail_dpe(d),
+                    "dpe_classe": d["classe"], "dpe_annee": d.get("annee")})
     for d in libres:  # adresse DPE sans parcelle retrouvée : on la garde dans la liste
         pos = d.get("pos")
         res.append({"parcelle": "", "terrain_m2": 0, "emprise_principale_m2": None, "nb_batiments": 0,
                     "forme_rectangle_pct": None, "geom": None,
                     "lat": round(pos[0], 6) if pos else None, "lon": round(pos[1], 6) if pos else None,
-                    "dpe": d["adresse"], "s_dpe": d["s_dpe"], "dpe_pos": pos, "dpe_detail": detail_dpe(d)})
+                    "dpe": d["adresse"], "s_dpe": d["s_dpe"], "dpe_pos": pos, "dpe_detail": detail_dpe(d),
+                    "dpe_classe": d["classe"], "dpe_annee": d.get("annee")})
     for r in res:
         r["s_cad"] = score_cadastre(r) if r.get("geom") else None
         r["s_glob"] = score_global(r["s_cad"], r["s_dpe"])
@@ -394,7 +397,8 @@ def ecrire(res, nom, args, dpe=None):
                                      "terrain": r["terrain_m2"] or None, "emprise": r["emprise_principale_m2"],
                                      "nom": r["parcelle"], "dpe": r.get("dpe", ""), "liens": a,
                                      "pos": [pos[0], pos[1]] if pos else None,
-                                     "centre": [r["lat"], r["lon"]] if r.get("geom") and r.get("lat") is not None else None}})
+                                     "forme": r["forme_rectangle_pct"], "classe": r.get("dpe_classe", ""),
+                                     "annee": r.get("dpe_annee")}})
     data = json.dumps({"type": "FeatureCollection", "features": feats}).replace("</", "<\\/")
     page = PAGE.replace("__DATA__", data) \
                .replace("__TITRE__", html.escape(f"{nom} – {len(res)} candidats")) \
@@ -410,13 +414,22 @@ PAGE = """<!DOCTYPE html><html lang="fr"><head><meta charset="utf-8"><meta name=
 table{border-collapse:collapse;width:100%}td,th{border-bottom:1px solid #ddd;padding:6px;text-align:left}tbody tr{cursor:pointer}
 .ctl{display:flex;flex-wrap:wrap;gap:14px;align-items:center;margin:8px 0}.ctl label{display:flex;gap:6px;align-items:center}
 .leg span{display:inline-block;width:12px;height:12px;border-radius:2px;margin:0 4px 0 10px;vertical-align:middle}
-.mute{color:#666;font-size:.85rem}#err{color:#b91c1c;font-weight:600}</style>
+.flt{margin:8px 0}.mute{color:#666;font-size:.85rem}#err{color:#b91c1c;font-weight:600}</style>
 </head><body><div id="map"></div><main><h2>__TITRE__</h2><p>__CRIT__</p><div id="err"></div>
 <div class="ctl">
 <label>Méthode <select id="mode"><option value="glob">Indice global (cadastre + DPE)</option>
 <option value="cad">Cadastre seul</option><option value="dpe">DPE seul</option></select></label>
 <label>Score minimum <b id="minv">0</b> <input type="range" id="min" min="0" max="100" value="0"></label>
 <label><input type="checkbox" id="showdpe" checked> Points des adresses DPE</label></div>
+<details class="flt"><summary><b>Filtres avancés</b></summary><div class="ctl">
+<label><input type="checkbox" id="f_dpe"> Avec adresse DPE seulement</label>
+<label>Classe énergie <select id="f_cl"><option value="">toutes</option><option>A</option><option>B</option><option>C</option><option>D</option><option>E</option><option>F</option><option>G</option></select></label>
+<label>Construit à partir de <input type="number" id="f_an" placeholder="ex. 2010" style="width:90px"></label>
+<label>Terrain (m²) <input type="number" id="f_t0" placeholder="min" style="width:80px"> – <input type="number" id="f_t1" placeholder="max" style="width:80px"></label>
+<label>Bâtiment (m²) <input type="number" id="f_b0" placeholder="min" style="width:80px"> – <input type="number" id="f_b1" placeholder="max" style="width:80px"></label>
+<label><input type="checkbox" id="f_lu"> Bâtiment en L / U (pas un simple rectangle)</label>
+<button id="f_rz" type="button">Réinitialiser</button></div>
+<p class="mute">Les lignes dont l’information est inconnue (année, bâtiment…) ne sont pas écartées par le filtre correspondant.</p></details>
 <p class="leg">Couleur :<span style="background:#dc2626"></span>85 et +<span style="background:#f97316"></span>70-84<span style="background:#eab308"></span>50-69<span style="background:#9ca3af"></span>moins de 50</p>
 <p class="mute" id="stat"></p>
 <div style="overflow-x:auto"><table><thead><tr><th>#</th><th>Global</th><th>Cadastre</th><th>DPE</th><th>Parcelle / adresse DPE</th><th>Terrain m²</th><th>Bâtiment m²</th><th>Liens</th></tr></thead>
@@ -439,8 +452,19 @@ try{
 function sc(p){var m=$('mode').value;return m=='cad'?p.s_cad:(m=='dpe'?p.s_dpe:p.s_glob)}
 function col(v){return v>=85?'#dc2626':(v>=70?'#f97316':(v>=50?'#eab308':'#9ca3af'))}
 function cell(tr,t){var td=document.createElement('td');td.textContent=t;tr.appendChild(td);return td}
+function num(id){var v=$(id).value;return v===''?null:+v}
+function ok(p){
+  if($('f_dpe').checked&&!p.dpe)return false;
+  var cl=$('f_cl').value;if(cl&&p.classe!==cl)return false;
+  var an=num('f_an');if(an!==null&&p.annee&&+p.annee<an)return false;
+  var t0=num('f_t0'),t1=num('f_t1');
+  if(p.terrain){if(t0!==null&&p.terrain<t0)return false;if(t1!==null&&p.terrain>t1)return false}
+  var b0=num('f_b0'),b1=num('f_b1');
+  if(p.emprise){if(b0!==null&&p.emprise<b0)return false;if(b1!==null&&p.emprise>b1)return false}
+  if($('f_lu').checked&&!(p.forme!==null&&p.forme!==undefined&&p.forme<=85))return false;
+  return true}
 function items(){var mn=+$('min').value;
-  return data.features.filter(function(f){var v=sc(f.properties);return v!==null&&v!==undefined&&v>=mn})
+  return data.features.filter(function(f){var v=sc(f.properties);return v!==null&&v!==undefined&&v>=mn&&ok(f.properties)})
     .sort(function(a,b){return sc(b.properties)-sc(a.properties)})}
 function renderTable(its){
   var tb=$('rows');tb.innerHTML='';
@@ -473,7 +497,6 @@ function renderMap(its,refit){
     var p=f.properties,c=col(sc(p)),ref=null;
     if(f.geometry){L.geoJSON(f,{style:function(){return{color:c,weight:3,fillColor:c,fillOpacity:.2}},
       onEachFeature:function(ft,l){l.bindPopup(p.popup);ref=l}}).addTo(lay)}
-    if(p.centre){L.circleMarker(p.centre,{radius:5,color:c,weight:2,fillColor:c,fillOpacity:.9}).bindPopup(p.popup).addTo(lay)}
     if(p.pos){var mk=L.circleMarker(p.pos,{radius:8,color:'#1d4ed8',weight:3,fillColor:c,fillOpacity:.9}).bindPopup(p.popup).addTo(dl);if(!ref)ref=mk}
     refs[i]=ref;
   });
@@ -488,6 +511,8 @@ function render(refit){
   try{renderMap(its,refit)}catch(e){err(e)}
 }
 $('mode').onchange=function(){render(true)};$('min').oninput=function(){render(false)};
+['f_dpe','f_cl','f_an','f_t0','f_t1','f_b0','f_b1','f_lu'].forEach(function(i){$(i).oninput=function(){render(true)};$(i).onchange=function(){render(true)}});
+$('f_rz').onclick=function(){$('f_dpe').checked=false;$('f_lu').checked=false;$('f_cl').value='';['f_an','f_t0','f_t1','f_b0','f_b1'].forEach(function(i){$(i).value=''});render(true)};
 $('showdpe').onchange=function(){if(!map)return;if(this.checked){map.addLayer(dl)}else{map.removeLayer(dl)}};
 render(true);
 </script></body></html>"""
