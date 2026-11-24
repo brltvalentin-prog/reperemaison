@@ -11,12 +11,12 @@ Exemple (annonce de Nouzilly, valeurs par défaut) :
 Autre annonce :
     python repere_parcelles.py --commune "Aubagne" --cp 13400 --terrain 800 --habitable 120
 """
-import argparse, csv, gzip, html, json, re, sys, webbrowser
+import argparse, csv, gzip, html, json, re, sys, unicodedata, webbrowser
 from pathlib import Path
 
 import requests
 from pyproj import Transformer
-from shapely.geometry import shape, mapping
+from shapely.geometry import Point, shape, mapping
 from shapely.ops import transform
 from shapely.strtree import STRtree
 
@@ -157,33 +157,190 @@ def liens(lat, lon):
     }
 
 
-def ecrire(res, nom, args):
+DPE_URL = "https://data.ademe.fr/data-fair/api/v1/datasets/dpe03existant/lines"
+DPE_CHAMPS = ("numero_dpe,etiquette_dpe,date_etablissement_dpe,surface_habitable_logement,"
+              "annee_construction,type_batiment,adresse_ban,code_postal_ban,nom_commune_ban")
+GEOCODE_URL = "https://data.geopf.fr/geocodage/search"
+
+
+def norm(t):
+    t = unicodedata.normalize("NFD", str(t or "")).encode("ascii", "ignore").decode().lower()
+    return re.sub(r"[^a-z0-9]", "", t)
+
+
+def codes_postaux(insee):
+    try:
+        r = requests.get(f"https://geo.api.gouv.fr/communes/{insee}", params={"fields": "codesPostaux"}, timeout=30)
+        r.raise_for_status()
+        return r.json().get("codesPostaux", [])
+    except Exception:
+        return []
+
+
+def telecharger_dpe(cps, log):
+    rows = []
+    for cp in cps:
+        url, params, pages = DPE_URL, {"code_postal_ban_in": cp, "select": DPE_CHAMPS, "size": 10000}, 0
+        while url and pages < 6:
+            r = requests.get(url, params=params if pages == 0 else None, timeout=120)
+            r.raise_for_status()
+            j = r.json()
+            if not j.get("results"):
+                break
+            rows += j["results"]
+            url = j.get("next")
+            pages += 1
+        log(f"DPE {cp} : {len(rows)} diagnostics lus")
+    return rows
+
+
+def chercher_dpe(args, insee, nom, log):
+    """Adresses dont le DPE (ADEME) a une surface habitable proche de celle de l'annonce."""
+    hab = float(args.habitable)
+    tol = max(hab * getattr(args, "hab_tol", 0.08), 5)
+    cps = set(codes_postaux(insee))
+    if args.cp:
+        cps.add(str(args.cp))
+    if not cps:
+        return []
+    rows = telecharger_dpe(sorted(cps), log)
+    n = norm(nom)
+    rows = [r for r in rows if norm(r.get("nom_commune_ban")) == n] or rows
+    classe = (getattr(args, "classe", "") or "").upper()
+    maison = getattr(args, "type_bien", "maison") == "maison"
+
+    def choisir(filtre_type):
+        best = {}
+        for r in rows:
+            try:
+                s = float(r.get("surface_habitable_logement"))
+            except (TypeError, ValueError):
+                continue
+            if abs(s - hab) > tol or not r.get("adresse_ban"):
+                continue
+            if filtre_type and not str(r.get("type_batiment", "")).lower().startswith("maison"):
+                continue
+            a = r["adresse_ban"]
+            if a not in best or str(r.get("date_etablissement_dpe", "")) > str(best[a].get("date_etablissement_dpe", "")):
+                best[a] = r
+        return best
+
+    best = choisir(maison) or (choisir(False) if maison else {})
+    out = []
+    for a, r in best.items():
+        s = float(r["surface_habitable_logement"])
+        e = (r.get("etiquette_dpe") or "").upper()
+        out.append({"adresse": a, "surface": s, "classe": e, "annee": r.get("annee_construction"),
+                    "date": str(r.get("date_etablissement_dpe", ""))[:10],
+                    "s_surf": 1 - borne(abs(s - hab) / tol),
+                    "s_classe": 0.5 if not classe or not e else (1.0 if e == classe else 0.0)})
+    out.sort(key=lambda d: -(0.6 * d["s_surf"] + 0.4 * d["s_classe"]))
+    return out[:15]
+
+
+def geocoder(adresse):
+    try:
+        r = requests.get(GEOCODE_URL, params={"q": adresse, "limit": 1}, timeout=30)
+        r.raise_for_status()
+        lon, lat = r.json()["features"][0]["geometry"]["coordinates"][:2]
+        return lat, lon
+    except Exception:
+        return None
+
+
+def situer_dpe(dpe, parcelles, args):
+    """Place chaque adresse DPE sur la carte et retrouve sa parcelle cadastrale."""
+    for d in dpe:
+        d["pos"] = geocoder(d["adresse"])
+    if any(d["pos"] for d in dpe):
+        formes, index = [], []
+        for i, ft in enumerate(parcelles["features"]):
+            try:
+                formes.append(shape(ft["geometry"]))
+                index.append(i)
+            except Exception:
+                continue
+        arbre = STRtree(formes)
+        for d in dpe:
+            if not d["pos"]:
+                continue
+            pt = Point(d["pos"][1], d["pos"][0])
+            idx = arbre.query(pt, predicate="intersects")
+            if not len(idx):
+                idx = arbre.query_nearest(pt, max_distance=0.0003)
+            if len(idx):
+                pr = parcelles["features"][index[int(idx[0])]]["properties"]
+                d["parcelle"] = pr.get("id")
+                d["terrain"] = int(pr.get("contenance") or 0)
+    tol = max(args.tolerance, 0.25)
+    for d in dpe:
+        s_t = 1 - borne(abs(d["terrain"] - args.terrain) / (args.terrain * tol)) if d.get("terrain") else 0.5
+        d["score"] = round(100 * (0.45 * d["s_surf"] + 0.2 * d["s_classe"] + 0.35 * s_t))
+    dpe.sort(key=lambda d: -d["score"])
+    return dpe
+
+
+def liens_html(lat, lon):
+    return " · ".join(f'<a href="{u}" target="_blank" rel="noopener">{k}</a>' for k, u in liens(lat, lon).items())
+
+
+def ecrire(res, nom, args, dpe=None):
+    dpe = dpe or []
     OUT.mkdir(exist_ok=True)
     with open(OUT / "candidats.csv", "w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f, delimiter=";")
         w.writerow(["rang", "parcelle", "terrain_m2", "emprise_principale_m2", "nb_batiments",
-                    "forme_rectangle_pct", "score", "lat", "lon", "satellite", "street_view"])
+                    "forme_rectangle_pct", "score", "lat", "lon", "satellite", "street_view", "adresse_dpe"])
         for i, r in enumerate(res, 1):
             l = liens(r["lat"], r["lon"])
-            w.writerow([i, r["parcelle"], r["terrain_m2"], r["emprise_principale_m2"],
-                        r["nb_batiments"], r["forme_rectangle_pct"], r["score"], r["lat"],
-                        r["lon"], l["Satellite"], l["Street View"]])
+            w.writerow([i, r["parcelle"], r["terrain_m2"], r["emprise_principale_m2"], r["nb_batiments"],
+                        r["forme_rectangle_pct"], r["score"], r["lat"], r["lon"],
+                        l["Satellite"], l["Street View"], r.get("dpe", "")])
+    if dpe:
+        with open(OUT / "candidats_dpe.csv", "w", newline="", encoding="utf-8-sig") as f:
+            w = csv.writer(f, delimiter=";")
+            w.writerow(["rang", "adresse", "classe", "surface_m2", "annee_construction", "date_dpe",
+                        "parcelle", "terrain_m2", "score"])
+            for i, d in enumerate(dpe, 1):
+                w.writerow([i, d["adresse"], d["classe"], d["surface"], d.get("annee") or "", d["date"],
+                            d.get("parcelle", ""), d.get("terrain", ""), d["score"]])
     feats, lignes = [], []
     for i, r in enumerate(res, 1):
-        l = liens(r["lat"], r["lon"])
-        a = " · ".join(f'<a href="{u}" target="_blank" rel="noopener">{k}</a>' for k, u in l.items())
+        a = liens_html(r["lat"], r["lon"])
+        extra = f"<br>✔ DPE : {html.escape(r['dpe'])}" if r.get("dpe") else ""
         info = (f"<b>#{i} – score {r['score']}</b><br>{html.escape(r['parcelle'])}<br>"
-                f"Terrain {r['terrain_m2']} m² · bâtiment {r['emprise_principale_m2']} m²<br>{a}")
+                f"Terrain {r['terrain_m2']} m² · bâtiment {r['emprise_principale_m2']} m²{extra}<br>{a}")
         feats.append({"type": "Feature", "geometry": r["geom"],
                       "properties": {"popup": info, "score": r["score"]}})
         lignes.append(f"<tr><td>{i}</td><td>{html.escape(r['parcelle'])}</td><td>{r['terrain_m2']}</td>"
                       f"<td>{r['emprise_principale_m2']}</td><td>{r['forme_rectangle_pct']} %</td>"
-                      f"<td><b>{r['score']}</b></td><td>{a}</td></tr>")
+                      f"<td><b>{r['score']}</b></td><td>{html.escape(r.get('dpe', ''))}</td><td>{a}</td></tr>")
+    pts, dl = [], []
+    for i, d in enumerate(dpe, 1):
+        detail = f"DPE {d['classe'] or '?'} · {int(d['surface'])} m²"
+        if d.get("terrain"):
+            detail += f" · terrain {d['terrain']} m²"
+        if d.get("annee"):
+            detail += f" · construit {d['annee']}"
+        a = liens_html(*d["pos"]) if d.get("pos") else ""
+        dl.append(f"<tr><td>{i}</td><td>{html.escape(d['adresse'])}</td><td>{detail}</td>"
+                  f"<td><b>{d['score']}</b></td><td>{a}</td></tr>")
+        if d.get("pos"):
+            pts.append({"lat": d["pos"][0], "lon": d["pos"][1],
+                        "popup": f"<b>DPE #{i}</b><br>{html.escape(d['adresse'])}<br>{detail}<br>{a}"})
+    bloc = ""
+    if dl:
+        bloc = ("<h3>Adresses trouvées via les diagnostics énergétiques (DPE)</h3>"
+                "<p>Cercles bleus sur la carte. Base publique ADEME : à utiliser pour repérer le bien avant de "
+                "contacter l’agence ou le vendeur, dans le respect de la vie privée des occupants.</p>"
+                "<table><tr><th>#</th><th>Adresse</th><th>Détail</th><th>Score</th><th>Liens</th></tr>"
+                + "\n".join(dl) + "</table><h3>Parcelles candidates (cadastre)</h3>")
     data = json.dumps({"type": "FeatureCollection", "features": feats}).replace("</", "<\\/")
     page = PAGE.replace("__DATA__", data).replace("__ROWS__", "\n".join(lignes)) \
-               .replace("__TITRE__", html.escape(f"{nom} – {len(res)} candidats")) \
-               .replace("__CRIT__", html.escape(f"Terrain ≈ {args.terrain} m² (±{int(args.tolerance*100)} %), "
-                                                f"habitable ≈ {args.habitable} m²"))
+               .replace("__PTS__", json.dumps(pts).replace("</", "<\\/")).replace("__DPE__", bloc) \
+               .replace("__TITRE__", html.escape(f"{nom} – {len(dpe)} adresse(s) DPE, {len(res)} parcelles")) \
+               .replace("__CRIT__", html.escape(f"Terrain ≈ {args.terrain:.0f} m² (±{int(args.tolerance*100)} %), "
+                                                f"habitable ≈ {args.habitable:.0f} m²"))
     (OUT / "candidats.html").write_text(page, encoding="utf-8")
     return OUT / "candidats.html"
 
@@ -192,19 +349,22 @@ PAGE = """<!DOCTYPE html><html lang="fr"><head><meta charset="utf-8"><meta name=
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
 <style>body{font:15px system-ui,sans-serif;margin:0}#map{height:55vh}main{padding:12px 16px}
 table{border-collapse:collapse;width:100%}td,th{border-bottom:1px solid #ddd;padding:6px;text-align:left}</style>
-</head><body><div id="map"></div><main><h2>__TITRE__</h2><p>__CRIT__. Clique une parcelle sur la carte
-ou un lien du tableau, puis compare avec les photos de l’annonce.</p>
-<table><tr><th>#</th><th>Parcelle</th><th>Terrain m²</th><th>Bâtiment m²</th><th>Forme</th><th>Score</th><th>Liens</th></tr>
-__ROWS__</table></main>
+</head><body><div id="map"></div><main><h2>__TITRE__</h2><p>__CRIT__. Rouge/orange : parcelles du cadastre.
+Cercles bleus : adresses trouvées via les DPE. Clique un repère ou un lien, puis compare avec les photos de l’annonce.</p>
+__DPE__
+<div style="overflow-x:auto"><table><tr><th>#</th><th>Parcelle</th><th>Terrain m²</th><th>Bâtiment m²</th><th>Forme</th><th>Score</th><th>Adresse DPE</th><th>Liens</th></tr>
+__ROWS__</table></div></main>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script>
-var data=__DATA__;
+var data=__DATA__,pts=__PTS__;
 var ortho=L.tileLayer('https://data.geopf.fr/wmts?SERVICE=WMTS&REQUEST=GetTile&VERSION=1.0.0&LAYER=ORTHOIMAGERY.ORTHOPHOTOS&STYLE=normal&TILEMATRIXSET=PM&TILEMATRIX={z}&TILEROW={y}&TILECOL={x}&FORMAT=image/jpeg',{maxZoom:19,attribution:'© IGN'});
 var osm=L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19,attribution:'© OpenStreetMap'});
 var map=L.map('map',{layers:[ortho]});L.control.layers({'Photo aérienne IGN':ortho,'Plan OSM':osm}).addTo(map);
 var layer=L.geoJSON(data,{style:function(f){return{color:f.properties.score>=70?'#e11d48':'#f59e0b',weight:2,fillOpacity:.15}},
 onEachFeature:function(f,l){l.bindPopup(f.properties.popup)}}).addTo(map);
-if(data.features.length){map.fitBounds(layer.getBounds())}else{map.setView([46.6,2.4],6)}
+var grp=L.featureGroup([layer]);
+pts.forEach(function(p){grp.addLayer(L.circleMarker([p.lat,p.lon],{radius:9,color:'#1d4ed8',weight:3,fillOpacity:.5}).bindPopup(p.popup).addTo(map))});
+if(data.features.length||pts.length){map.fitBounds(grp.getBounds().pad(.1))}else{map.setView([46.6,2.4],6)}
 </script></body></html>"""
 
 
@@ -228,6 +388,9 @@ def extraire_annonce(texte):
         if nom and not nom.lower().startswith(("ref", "réf")):
             res["commune"], res["cp"] = nom, m.group(2)
             break
+    m = re.search(r"(?i:classe\s*(?:énergie|energie|dpe)?|dpe|énergie)\D{0,20}\b([A-G])\b", texte)
+    if m:
+        res["classe"] = m.group(1)
     return res
 
 
@@ -244,11 +407,25 @@ def run(args, log=print):
     batiments = charger(insee, dep, "batiments")
     log(f"{len(parcelles['features'])} parcelles, {len(batiments['features'])} bâtiments analysés…")
     res = analyser(args, parcelles, batiments)
-    if not res:
+    dpe = []
+    if getattr(args, "utiliser_dpe", True):
+        try:
+            dpe = situer_dpe(chercher_dpe(args, insee, nom, log), parcelles, args)
+            log(f"{len(dpe)} adresse(s) trouvée(s) via les DPE.")
+        except Exception as e:
+            log(f"DPE indisponible ({e}) : seuls les résultats du cadastre sont affichés.")
+    par_dpe = {d["parcelle"]: d for d in dpe if d.get("parcelle")}
+    for r in res:
+        d = par_dpe.get(r["parcelle"])
+        if d:
+            r["dpe"] = d["adresse"]
+            r["score"] = min(100, r["score"] + 25)
+    res.sort(key=lambda r: -r["score"])
+    if not res and not dpe:
         raise RuntimeError("Aucun candidat. Élargis la tolérance ou baisse la taille minimale du bâtiment.")
     res = res[:getattr(args, "max_resultats", 60)]
-    page = ecrire(res, nom, args)
-    log(f"{len(res)} candidats retenus.")
+    page = ecrire(res, nom, args, dpe)
+    log(f"{len(res)} parcelles et {len(dpe)} adresses DPE retenues.")
     return page
 
 
@@ -262,6 +439,9 @@ def main():
     ap.add_argument("--tolerance", type=float, default=0.15, help="écart toléré sur le terrain (0.15 = ±15 %%)")
     ap.add_argument("--emprise-min", dest="emprise_min", type=float, default=140,
                     help="emprise minimale du bâtiment principal (m²)")
+    ap.add_argument("--classe", default="", help="classe énergie de l'annonce (A à G)")
+    ap.add_argument("--hab-tol", dest="hab_tol", type=float, default=0.08, help="écart toléré sur la surface habitable (0.08 = ±8 %%)")
+    ap.add_argument("--sans-dpe", dest="utiliser_dpe", action="store_false", help="ne pas interroger les DPE")
     ap.add_argument("--no-open", action="store_true", help="ne pas ouvrir le navigateur")
     args = ap.parse_args()
     try:
