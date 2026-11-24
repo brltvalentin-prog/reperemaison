@@ -32,7 +32,7 @@ with st.form("recherche"):
     with st.expander("Options"):
         dpe = st.checkbox("Chercher aussi les adresses via les DPE", value=True)
         maison = st.checkbox("C'est une maison (pas un appartement)", value=True)
-        tolerance = st.slider("Tolérance sur le terrain (%)", 5, 40, 15)
+        tolerance = st.slider("Tolérance sur le terrain (%) — 0 = surface identique au cadastre", 0, 40, 15)
         hab_tol = st.slider("Tolérance sur la surface habitable (%)", 2, 20, 8)
         texte = st.text_area("Ou colle le texte de l'annonce (remplit les champs vides)", height=100)
     ok = st.form_submit_button("Chercher les maisons", type="primary")
