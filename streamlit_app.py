@@ -34,11 +34,11 @@ def chercher_communes(saisie):
 
 
 @st.cache_data(show_spinner=False)
-def calculer(commune, cp, insee, terrain, habitable, tolerance, classe, maison, hab_tol, dpe):
+def calculer(commune, cp, insee, terrain, habitable, tolerance, classe, maison, hab_tol, dpe, fusion):
     args = Namespace(commune=commune, cp=cp, insee=insee or None, terrain=float(terrain), habitable=float(habitable),
                      tolerance=tolerance / 100, emprise_min=round(float(habitable) * 0.7),
                      classe=classe, type_bien="maison" if maison else "", hab_tol=hab_tol / 100,
-                     utiliser_dpe=dpe, no_open=True, max_resultats=60)
+                     utiliser_dpe=dpe, fusion_parcelles=fusion, no_open=True, max_resultats=60)
     page = rp.run(args, log=lambda *_: None)
     return page.read_text(encoding="utf-8")
 
@@ -70,6 +70,8 @@ with st.form("recherche"):
         maison = st.checkbox("C'est une maison (pas un appartement)", value=True)
         tolerance = st.slider("Tolérance sur le terrain (%) — 0 = surface identique au cadastre", 0, 40, 15)
         hab_tol = st.slider("Tolérance sur la surface habitable (%)", 2, 20, 8)
+        fusion = st.slider("Regrouper jusqu'à N parcelles voisines (1 = aucun regroupement)", 1, 4, 3,
+                           help="Une annonce peut couvrir plusieurs parcelles du cadastre : on additionne leurs surfaces.")
         texte = st.text_area("Ou colle le texte de l'annonce (remplit les champs vides)", height=100)
     ok = st.form_submit_button("Chercher les maisons", type="primary")
 
@@ -89,7 +91,7 @@ if ok:
     else:
         try:
             with st.spinner("Analyse en cours (de quelques secondes à quelques minutes)…"):
-                doc = calculer(commune, cp, insee, terrain, habitable, tolerance, classe, maison, hab_tol, dpe)
+                doc = calculer(commune, cp, insee, terrain, habitable, tolerance, classe, maison, hab_tol, dpe, fusion)
             st.success(f"Résultats pour {commune} : une seule liste, avec un indice global. "
                        "Change de méthode (global, cadastre seul, DPE seul) au-dessus du tableau.")
             components.html(doc, height=1000, scrolling=True)

@@ -18,7 +18,7 @@ from urllib.parse import quote
 import requests
 from pyproj import Transformer
 from shapely.geometry import Point, shape, mapping
-from shapely.ops import transform
+from shapely.ops import transform, unary_union
 from shapely.strtree import STRtree
 
 BASE = "https://cadastre.data.gouv.fr/data/etalab-cadastre/latest/geojson/communes"
@@ -127,50 +127,103 @@ def score_global(s_cad, s_dpe):
     return 0
 
 
+def regrouper(bases, voisins, surf, cible, tol, nmax, garder=3):
+    """Groupes de parcelles contiguës (jusqu'à nmax) contenant une parcelle bâtie et dont la surface
+    totale colle à la cible. Fonction pure : `voisins(i)` donne les parcelles qui touchent la parcelle i."""
+    marge = cible * tol + 0.5
+    final = {}
+    for b in bases:
+        vus, pile, trouves = set(), [frozenset([b])], []
+        while pile:
+            g = pile.pop()
+            if g in vus:
+                continue
+            vus.add(g)
+            total = sum(surf[i] for i in g)
+            if abs(total - cible) <= marge:
+                trouves.append((abs(total - cible), len(g), sorted(g), g, total))
+            if len(g) < nmax and total < cible + marge:
+                for i in list(g):
+                    for j in voisins(i):
+                        if j not in g:
+                            pile.append(g | {j})
+        trouves.sort(key=lambda t: (t[0], t[1], t[2]))
+        for _, _, _, g, total in trouves[:garder]:
+            final[g] = total
+    return final
+
+
 def analyser(args, parcelles, batiments):
-    bats = []
+    cible = args.terrain
+    emprise_attendue = args.habitable * 1.1  # plain-pied : emprise ≈ surface habitable + garage
+    nmax = max(1, int(getattr(args, "fusion_parcelles", 3)))
+    P = []
+    for ft in parcelles["features"]:
+        try:
+            gw = shape(ft["geometry"])
+        except Exception:
+            continue
+        pr = ft.get("properties") or {}
+        surf = pr.get("contenance") or transform(TO_L93, gw).area
+        P.append({"id": pr.get("id", ""), "surf": surf, "w": gw})
+    if not P:
+        return []
+    arbre = STRtree([q["w"] for q in P])
+    bati = {}  # indice de parcelle -> bâtiments en dur (géométries Lambert-93) dont le point central y tombe
     for ft in batiments["features"]:
         if (ft.get("properties") or {}).get("type") not in (None, "01"):
             continue  # on ignore les bâtiments « légers » (abris, serres…)
         try:
-            bats.append(transform(TO_L93, shape(ft["geometry"])))
+            bw = shape(ft["geometry"])
+            bl = transform(TO_L93, bw)
+            idx = arbre.query(bw.representative_point(), predicate="intersects")
         except Exception:
             continue
-    arbre = STRtree(bats)
-    cible = args.terrain
-    emprise_attendue = args.habitable * 1.1  # plain-pied : emprise ≈ surface habitable + garage
+        if len(idx):
+            bati.setdefault(int(idx[0]), []).append(bl)
+    bases = sorted(i for i, bs in bati.items() if max(b.area for b in bs) >= args.emprise_min)
+    cache = {}
+
+    def voisins(i):
+        if i not in cache:
+            gi, c = P[i]["w"], []
+            for j in arbre.query(gi, predicate="intersects"):
+                j = int(j)
+                if j == i:
+                    continue
+                try:
+                    commun = gi.boundary.intersection(P[j]["w"].boundary).length
+                except Exception:
+                    commun = 0
+                if commun > 1e-5:  # ≈ 1 m de limite commune (pas un simple coin)
+                    c.append((commun, j))
+            c.sort(reverse=True)
+            cache[i] = [j for _, j in c[:8]]
+        return cache[i]
+
+    groupes = regrouper(bases, voisins, [q["surf"] for q in P], cible, args.tolerance, nmax)
     out = []
-    for ft in parcelles["features"]:
-        p = ft["properties"]
-        try:
-            g_wgs = shape(ft["geometry"])
-            g = transform(TO_L93, g_wgs)
-        except Exception:
-            continue
-        surf = p.get("contenance") or g.area
-        if abs(surf - cible) > cible * args.tolerance + 0.5:
-            continue
-        dedans = []
-        for i in arbre.query(g, predicate="intersects"):
-            b = bats[i]
-            if b.area and b.intersection(g).area / b.area > 0.5:
-                dedans.append(b)
+    for g, total in groupes.items():
+        idxs = sorted(g)
+        dedans = [b for i in idxs for b in bati.get(i, [])]
         if not dedans:
             continue
         principal = max(dedans, key=lambda b: b.area)
         if principal.area < args.emprise_min:
             continue
         remplissage = principal.area / principal.minimum_rotated_rectangle.area
-        s_surf = score_terrain(surf, cible, args.tolerance)
+        gw = P[idxs[0]]["w"] if len(idxs) == 1 else unary_union([P[i]["w"] for i in idxs])
+        s_surf = score_terrain(total, cible, args.tolerance) * (0.95 ** (len(idxs) - 1))  # léger avantage aux parcelles seules
         s_emp = 1 - borne(abs(principal.area - emprise_attendue) / (emprise_attendue * 0.5))
         s_forme = borne((0.92 - remplissage) / 0.25)  # L/U > rectangle
-        c = g_wgs.centroid
+        c = gw.centroid
+        ids = [P[i]["id"] for i in idxs]
         out.append({
-            "parcelle": p.get("id", ""), "terrain_m2": int(surf),
+            "parcelle": " + ".join(ids), "ids": ids, "terrain_m2": int(total),
             "emprise_principale_m2": int(principal.area),
             "nb_batiments": len(dedans), "forme_rectangle_pct": int(remplissage * 100),
             "s_terrain": s_surf, "s_emprise": s_emp, "s_forme": s_forme,
-            "lat": round(c.y, 6), "lon": round(c.x, 6), "geom": mapping(g_wgs),
+            "lat": round(c.y, 6), "lon": round(c.x, 6), "geom": mapping(gw),
         })
     return out
 
@@ -183,9 +236,10 @@ def liens(lat, lon):
     }
 
 
-DPE_URL = "https://data.ademe.fr/data-fair/api/v1/datasets/dpe03existant/lines"
+DPE_BASE = "https://data.ademe.fr/data-fair/api/v1/datasets"
+DPE_JEUX = [("dpe03existant", "existant"), ("dpe02neuf", "neuf")]  # logements existants / logements neufs (depuis 07/2021)
 DPE_CHAMPS = ("numero_dpe,etiquette_dpe,date_etablissement_dpe,surface_habitable_logement,"
-              "annee_construction,type_batiment,adresse_ban,code_postal_ban,nom_commune_ban")
+              "type_batiment,adresse_ban,code_postal_ban,nom_commune_ban")
 GEOCODE_URL = "https://data.geopf.fr/geocodage/search"
 
 
@@ -203,20 +257,46 @@ def codes_postaux(insee):
         return []
 
 
+def lire_jeu(jeu, cp):
+    """Lit tous les DPE d'un code postal dans un jeu ADEME ; réessaie sans les champs optionnels si le jeu les ignore."""
+    derniere = None
+    for champs in (DPE_CHAMPS + ",annee_construction", DPE_CHAMPS, None):
+        params = {"code_postal_ban_in": cp, "size": 10000 if champs else 2000}
+        if champs:
+            params["select"] = champs
+        try:
+            rows, url, pages = [], f"{DPE_BASE}/{jeu}/lines", 0
+            while url and pages < 6:
+                r = requests.get(url, params=params if pages == 0 else None, timeout=120)
+                r.raise_for_status()
+                j = r.json()
+                if not j.get("results"):
+                    break
+                rows += j["results"]
+                url = j.get("next")
+                pages += 1
+            return rows
+        except Exception as e:
+            derniere = e
+    raise derniere
+
+
 def telecharger_dpe(cps, log):
-    rows = []
-    for cp in cps:
-        url, params, pages = DPE_URL, {"code_postal_ban_in": cp, "select": DPE_CHAMPS, "size": 10000}, 0
-        while url and pages < 6:
-            r = requests.get(url, params=params if pages == 0 else None, timeout=120)
-            r.raise_for_status()
-            j = r.json()
-            if not j.get("results"):
-                break
-            rows += j["results"]
-            url = j.get("next")
-            pages += 1
-        log(f"DPE {cp} : {len(rows)} diagnostics lus")
+    rows, erreurs = [], []
+    for jeu, nom in DPE_JEUX:
+        for cp in cps:
+            try:
+                lus = lire_jeu(jeu, cp)
+            except Exception as e:
+                erreurs.append(nom)
+                log(f"⚠ DPE {nom} indisponible ({e})")
+                continue
+            for r in lus:
+                r["_jeu"] = nom
+            rows += lus
+            log(f"DPE {nom} {cp} : {len(lus)} diagnostics lus")
+    if not rows and erreurs:
+        raise RuntimeError("aucun jeu DPE n'a répondu")
     return rows
 
 
@@ -257,7 +337,7 @@ def chercher_dpe(args, insee, nom, log):
         s = float(r["surface_habitable_logement"])
         e = (r.get("etiquette_dpe") or "").upper()
         out.append({"adresse": a, "surface": s, "classe": e, "annee": r.get("annee_construction"),
-                    "date": str(r.get("date_etablissement_dpe", ""))[:10],
+                    "date": str(r.get("date_etablissement_dpe", ""))[:10], "jeu": r.get("_jeu", "existant"),
                     "s_surf": 1 - borne(abs(s - hab) / tol),
                     "s_classe": 0.5 if not classe or not e else (1.0 if e == classe else 0.0)})
     out.sort(key=lambda d: -(0.6 * d["s_surf"] + 0.4 * d["s_classe"]))
@@ -316,11 +396,18 @@ def detail_dpe(d):
     t = f"DPE {d['classe'] or '?'} · {int(d['surface'])} m²"
     if d.get("annee"):
         t += f" · construit {d['annee']}"
+    if d.get("jeu") == "neuf":
+        t += " · logement neuf"
     return t
 
 
+def nom_parcelles(ids):
+    n = " + ".join(i[8:] if len(i) > 8 else i for i in ids)
+    return n + f" ({len(ids)} parcelles regroupées)" if len(ids) > 1 else n
+
+
 def fusionner(res, dpe, args):
-    """Une seule liste : parcelles du cadastre + adresses DPE, avec scores cadastre, DPE et global."""
+    """Une seule liste : parcelles (ou groupes de parcelles) du cadastre + adresses DPE, avec trois scores."""
     par, libres = {}, []
     for d in sorted(dpe, key=lambda d: -d["s_dpe"]):
         pid = d.get("parcelle")
@@ -330,17 +417,19 @@ def fusionner(res, dpe, args):
             par[pid] = d  # la meilleure adresse DPE de la parcelle
     deja = set()
     for r in res:
-        d = par.get(r["parcelle"])
+        r.setdefault("ids", [r["parcelle"]] if r.get("parcelle") else [])
+        cands = [par[i] for i in r["ids"] if i in par]
+        d = max(cands, key=lambda x: x["s_dpe"]) if cands else None
         r.update(dpe=d["adresse"] if d else "", s_dpe=d["s_dpe"] if d else None,
                  dpe_pos=d.get("pos") if d else None, dpe_detail=detail_dpe(d) if d else "",
                  dpe_classe=d["classe"] if d else "", dpe_annee=d.get("annee") if d else None)
-        deja.add(r["parcelle"])
+        deja.update(r["ids"])
     for pid, d in par.items():  # parcelle repérée par le DPE mais au terrain différent de l'annonce
         if pid in deja:
             continue
         pos = d.get("pos")
-        res.append({"parcelle": pid, "terrain_m2": d.get("terrain") or 0, "emprise_principale_m2": None,
-                    "nb_batiments": 0, "forme_rectangle_pct": None,
+        res.append({"parcelle": pid, "ids": [pid], "terrain_m2": d.get("terrain") or 0,
+                    "emprise_principale_m2": None, "nb_batiments": 0, "forme_rectangle_pct": None,
                     "s_terrain": score_terrain(d["terrain"], args.terrain, args.tolerance) if d.get("terrain") else None,
                     "s_emprise": None, "s_forme": None, "geom": d.get("geom"),
                     "lat": round(pos[0], 6) if pos else None, "lon": round(pos[1], 6) if pos else None,
@@ -348,7 +437,7 @@ def fusionner(res, dpe, args):
                     "dpe_classe": d["classe"], "dpe_annee": d.get("annee")})
     for d in libres:  # adresse DPE sans parcelle retrouvée : on la garde dans la liste
         pos = d.get("pos")
-        res.append({"parcelle": "", "terrain_m2": 0, "emprise_principale_m2": None, "nb_batiments": 0,
+        res.append({"parcelle": "", "ids": [], "terrain_m2": 0, "emprise_principale_m2": None, "nb_batiments": 0,
                     "forme_rectangle_pct": None, "geom": None,
                     "lat": round(pos[0], 6) if pos else None, "lon": round(pos[1], 6) if pos else None,
                     "dpe": d["adresse"], "s_dpe": d["s_dpe"], "dpe_pos": pos, "dpe_detail": detail_dpe(d),
@@ -367,21 +456,22 @@ def liens_ligne(r):
     return f'<a href="https://www.google.com/maps/search/?api=1&query={q}" target="_blank" rel="noopener">Google Maps</a>'
 
 
-def ecrire(res, nom, args, dpe=None):
+def ecrire(res, nom, args, dpe=None, notes=None):
     OUT.mkdir(exist_ok=True)
     v = lambda x: "" if x is None else x
     with open(OUT / "candidats.csv", "w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f, delimiter=";")
-        w.writerow(["rang", "indice_global", "score_cadastre", "score_dpe", "parcelle", "adresse_dpe", "detail_dpe",
-                    "terrain_m2", "emprise_principale_m2", "forme_rectangle_pct", "lat", "lon"])
+        w.writerow(["rang", "indice_global", "score_cadastre", "score_dpe", "parcelle", "nb_parcelles", "adresse_dpe",
+                    "detail_dpe", "terrain_m2", "emprise_principale_m2", "forme_rectangle_pct", "lat", "lon"])
         for i, r in enumerate(res, 1):
-            w.writerow([i, r["s_glob"], v(r["s_cad"]), v(r["s_dpe"]), r["parcelle"], r.get("dpe", ""),
-                        r.get("dpe_detail", ""), r["terrain_m2"] or "", v(r["emprise_principale_m2"]),
-                        v(r["forme_rectangle_pct"]), v(r["lat"]), v(r["lon"])])
+            w.writerow([i, r["s_glob"], v(r["s_cad"]), v(r["s_dpe"]), r["parcelle"], len(r.get("ids", [])),
+                        r.get("dpe", ""), r.get("dpe_detail", ""), r["terrain_m2"] or "",
+                        v(r["emprise_principale_m2"]), v(r["forme_rectangle_pct"]), v(r["lat"]), v(r["lon"])])
     feats = []
     for r in res:
         a = liens_ligne(r)
-        titre = r["parcelle"] or r["dpe"]
+        nom_aff = nom_parcelles(r.get("ids", []))
+        titre = nom_aff or r["dpe"]
         info = (f"<b>{html.escape(titre)}</b><br>Global {r['s_glob']} · cadastre {v(r['s_cad']) or '–'} · "
                 f"DPE {v(r['s_dpe']) if r['s_dpe'] is not None else '–'}")
         if r["terrain_m2"]:
@@ -395,12 +485,13 @@ def ecrire(res, nom, args, dpe=None):
         feats.append({"type": "Feature", "geometry": r.get("geom"),
                       "properties": {"popup": info, "s_glob": r["s_glob"], "s_cad": r["s_cad"], "s_dpe": r["s_dpe"],
                                      "terrain": r["terrain_m2"] or None, "emprise": r["emprise_principale_m2"],
-                                     "nom": r["parcelle"], "dpe": r.get("dpe", ""), "liens": a,
+                                     "nom": nom_aff, "dpe": r.get("dpe", ""), "liens": a,
                                      "pos": [pos[0], pos[1]] if pos else None,
                                      "forme": r["forme_rectangle_pct"], "classe": r.get("dpe_classe", ""),
                                      "annee": r.get("dpe_annee")}})
     data = json.dumps({"type": "FeatureCollection", "features": feats}).replace("</", "<\\/")
-    page = PAGE.replace("__DATA__", data) \
+    bloc_notes = "".join(f"<p class='mute'>{html.escape(n)}</p>" for n in (notes or []))
+    page = PAGE.replace("__DATA__", data).replace("__NOTES__", bloc_notes) \
                .replace("__TITRE__", html.escape(f"{nom} – {len(res)} candidats")) \
                .replace("__CRIT__", html.escape(f"Terrain ≈ {args.terrain:.0f} m² (±{args.tolerance*100:.0f} %), "
                                                 f"habitable ≈ {args.habitable:.0f} m²"))
@@ -415,7 +506,7 @@ table{border-collapse:collapse;width:100%}td,th{border-bottom:1px solid #ddd;pad
 .ctl{display:flex;flex-wrap:wrap;gap:14px;align-items:center;margin:8px 0}.ctl label{display:flex;gap:6px;align-items:center}
 .leg span{display:inline-block;width:12px;height:12px;border-radius:2px;margin:0 4px 0 10px;vertical-align:middle}
 .flt{margin:8px 0}.mute{color:#666;font-size:.85rem}#err{color:#b91c1c;font-weight:600}</style>
-</head><body><div id="map"></div><main><h2>__TITRE__</h2><p>__CRIT__</p><div id="err"></div>
+</head><body><div id="map"></div><main><h2>__TITRE__</h2><p>__CRIT__</p><div id="err"></div>__NOTES__
 <div class="ctl">
 <label>Méthode <select id="mode"><option value="glob">Indice global (cadastre + DPE)</option>
 <option value="cad">Cadastre seul</option><option value="dpe">DPE seul</option></select></label>
@@ -553,6 +644,13 @@ def run(args, log=print):
     else:
         insee, dep, nom = trouver_commune(args.commune, args.cp)
     log(f"Commune : {nom} (INSEE {insee})")
+    notes = []
+
+    def log2(m):
+        log(m)
+        if str(m).startswith("⚠"):
+            notes.append(str(m))
+
     parcelles = charger(insee, dep, "parcelles")
     batiments = charger(insee, dep, "batiments")
     log(f"{len(parcelles['features'])} parcelles, {len(batiments['features'])} bâtiments analysés…")
@@ -560,16 +658,17 @@ def run(args, log=print):
     dpe = []
     if getattr(args, "utiliser_dpe", True):
         try:
-            dpe = situer_dpe(chercher_dpe(args, insee, nom, log), parcelles, args)
+            dpe = situer_dpe(chercher_dpe(args, insee, nom, log2), parcelles, args)
             log(f"{len(dpe)} adresse(s) trouvée(s) via les DPE.")
         except Exception as e:
-            log(f"DPE indisponible ({e}) : seuls les résultats du cadastre sont affichés.")
+            notes.append(f"⚠ DPE indisponible ({e}) : seuls les résultats du cadastre sont affichés.")
+            log(notes[-1])
     res = fusionner(res, dpe, args)
     if not res:
         raise RuntimeError("Aucun candidat. Élargis la tolérance ou baisse la taille minimale du bâtiment.")
     res = res[:getattr(args, "max_resultats", 60)]
-    page = ecrire(res, nom, args, dpe)
-    log(f"{len(res)} parcelles et {len(dpe)} adresses DPE retenues.")
+    page = ecrire(res, nom, args, dpe, notes)
+    log(f"{len(res)} candidats retenus.")
     return page
 
 
@@ -586,6 +685,7 @@ def main():
     ap.add_argument("--classe", default="", help="classe énergie de l'annonce (A à G)")
     ap.add_argument("--hab-tol", dest="hab_tol", type=float, default=0.08, help="écart toléré sur la surface habitable (0.08 = ±8 %%)")
     ap.add_argument("--sans-dpe", dest="utiliser_dpe", action="store_false", help="ne pas interroger les DPE")
+    ap.add_argument("--fusion", dest="fusion_parcelles", type=int, default=3, help="nombre max de parcelles voisines regroupées (1 = aucun regroupement)")
     ap.add_argument("--no-open", action="store_true", help="ne pas ouvrir le navigateur")
     args = ap.parse_args()
     try:
