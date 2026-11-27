@@ -1,6 +1,7 @@
-"""RepèreMaison V2 – version mobile (Streamlit). Cadastre + diagnostics énergétiques (DPE)."""
+"""RepèreMaison – version mobile (Streamlit). Cadastre + diagnostics énergétiques (DPE)."""
 from argparse import Namespace
 
+import requests
 import streamlit as st
 import streamlit.components.v1 as components
 
@@ -11,9 +12,30 @@ st.title("🏠 RepèreMaison")
 st.caption("Trouve la parcelle (et l'adresse probable) d'une annonce dont l'adresse est masquée.")
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def chercher_communes(saisie):
+    """Suggestions de communes d'après un code postal (5 chiffres) ou le début d'un nom."""
+    saisie = (saisie or "").strip()
+    params = {"fields": "nom,code,codesPostaux,departement", "limit": 10}
+    if saisie.isdigit():
+        if len(saisie) != 5:
+            return []
+        params["codePostal"] = saisie
+    elif len(saisie) >= 2:
+        params.update(nom=saisie, boost="population")
+    else:
+        return []
+    try:
+        r = requests.get("https://geo.api.gouv.fr/communes", params=params, timeout=15)
+        r.raise_for_status()
+        return r.json()
+    except Exception:
+        return []
+
+
 @st.cache_data(show_spinner=False)
-def calculer(commune, cp, terrain, habitable, tolerance, classe, maison, hab_tol, dpe):
-    args = Namespace(commune=commune, cp=cp, insee=None, terrain=float(terrain), habitable=float(habitable),
+def calculer(commune, cp, insee, terrain, habitable, tolerance, classe, maison, hab_tol, dpe):
+    args = Namespace(commune=commune, cp=cp, insee=insee or None, terrain=float(terrain), habitable=float(habitable),
                      tolerance=tolerance / 100, emprise_min=round(float(habitable) * 0.7),
                      classe=classe, type_bien="maison" if maison else "", hab_tol=hab_tol / 100,
                      utiliser_dpe=dpe, no_open=True, max_resultats=60)
@@ -21,9 +43,23 @@ def calculer(commune, cp, terrain, habitable, tolerance, classe, maison, hab_tol
     return page.read_text(encoding="utf-8")
 
 
+def libelle(c):
+    cps = ", ".join(c.get("codesPostaux", [])[:2])
+    dep = (c.get("departement") or {}).get("nom", "")
+    return f"{c['nom']} ({cps}) – {dep}"
+
+
+saisie = st.text_input("Code postal ou nom de la commune", placeholder="ex. 37380 ou Nouzilly",
+                       help="Tape le code postal (5 chiffres) ou le début du nom, puis valide : les communes proposées s'affichent.")
+choix = None
+resultats = chercher_communes(saisie)
+if resultats:
+    i = st.selectbox("Choisis la commune", range(len(resultats)), format_func=lambda k: libelle(resultats[k]))
+    choix = resultats[i]
+elif saisie.strip():
+    st.caption("Aucune commune trouvée : vérifie le code postal (5 chiffres) ou l'orthographe.")
+
 with st.form("recherche"):
-    commune = st.text_input("Commune", placeholder="ex. Nouzilly")
-    cp = st.text_input("Code postal (facultatif)", placeholder="37380")
     c1, c2 = st.columns(2)
     terrain = c1.number_input("Terrain (m²)", min_value=0, step=10, value=0)
     habitable = c2.number_input("Surface habitable (m²)", min_value=0, step=5, value=0)
@@ -39,8 +75,11 @@ with st.form("recherche"):
 
 if ok:
     infos = rp.extraire_annonce(texte or "")
-    commune = (commune or infos.get("commune") or "").strip()
-    cp = (cp or infos.get("cp") or "").strip()
+    if choix:
+        commune, insee = choix["nom"], choix["code"]
+        cp = saisie.strip() if saisie.strip().isdigit() else (choix.get("codesPostaux") or [""])[0]
+    else:
+        commune, insee, cp = (infos.get("commune") or "").strip(), "", (infos.get("cp") or "").strip()
     terrain = terrain or infos.get("terrain")
     habitable = habitable or infos.get("habitable")
     classe = classe or infos.get("classe", "")
@@ -50,7 +89,7 @@ if ok:
     else:
         try:
             with st.spinner("Analyse en cours (de quelques secondes à quelques minutes)…"):
-                doc = calculer(commune, cp, terrain, habitable, tolerance, classe, maison, hab_tol, dpe)
+                doc = calculer(commune, cp, insee, terrain, habitable, tolerance, classe, maison, hab_tol, dpe)
             st.success(f"Résultats pour {commune} : une seule liste, avec un indice global. "
                        "Change de méthode (global, cadastre seul, DPE seul) au-dessus du tableau.")
             components.html(doc, height=1000, scrolling=True)
